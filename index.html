@@ -741,9 +741,9 @@ function renderHeader(){
     chips=MONTHS.map(function(m){
       return '<button class="chip'+(state.month===m?' on':'')+'" data-month="'+m+'">'+MLABEL[m]+'积分</button>';
     }).join('')+NEWMONTH;
-    chips2=[['record','录入'],['rank','排名'],['group','小组'],['flow','积分管理']].map(function(p){
+    chips2=[['record','录入'],['rank','排名'],['group','小组'],['import','批量导入'],['flow','积分管理']].map(function(p){
       return '<button class="chip act'+(state.ptab===p[0]?' on':'')+'" data-ptab="'+p[0]+'">'+
-        ({record:'✎',rank:'◈',group:'◉',flow:'⚙'}[p[0]])+' '+p[1]+'</button>';
+        ({record:'✎',rank:'◈',group:'◉',import:'⤓',flow:'⚙'}[p[0]])+' '+p[1]+'</button>';
     }).join('');
     sub='2026年'+MLABEL[state.month]+' · 全班 '+fmt(sumMonth(state.month))+' 分 · '+DB.events.filter(function(e){return e.month===state.month}).length+' 条流水';
   }
@@ -857,8 +857,584 @@ function pageDash(){
   return h;
 }
 
+/* ============ 积分批量导入（图片识别 / Excel·CSV） ============ */
+var IMP={rows:[],src:'',date:'',busy:false,msg:''};
+
+function impToday(){
+  var d=new Date();
+  return d.getFullYear()+'-'+('0'+(d.getMonth()+1)).slice(-2)+'-'+('0'+d.getDate()).slice(-2);
+}
+function impItemName(id){
+  var it=ITEMS.filter(function(x){return x.id===id})[0];
+  return it?it.n:id;
+}
+
+var IMP_PROMPT=[
+  '这是一张班级积分登记表（可能是手写表格、打印表格或手机截图）。请把里面的积分记录读成结构化数据，只输出 JSON。',
+  '输出格式：',
+  '{"date":"2026-10-26","records":[{"name":"张三","item":"晨读","delta":1,"note":""}]}',
+  '硬性要求：',
+  '1. name 必须照抄图上的学生姓名，不许改字、不许补姓、不许猜测。',
+  '2. item 从下面这些项目里选最接近的一个：语文、数学、英语、物理、化学、生物、政治、晨读、七点前晨读、英语单词检测、违纪、问题1、问题2、监控抽查、考试进退、前十名、单科优秀。都不像就填图上的原文。',
+  '3. delta 是数字分值：加分为正数（图上写 +2 就填 2），扣分为负数（图上写 -2 或「扣2分」就填 -2）。',
+  '4. 如果是「姓名 × 项目」的矩阵表，每一个非空的格子拆成一条 record，item 用该列的列名。',
+  '5. 如果是「姓名 项目 分值」逐行的明细表，一行一条 record。',
+  '6. date 只有在图上明确写出日期时才填（格式 YYYY-MM-DD），读不到就填空字符串。',
+  '7. 看不清、被遮挡、拿不准的格子一律不要输出，绝对不要猜。',
+  '8. 只输出 JSON 本身，不要任何解释文字、不要 markdown 代码块。'
+].join('\n');
+
+/* ---- 通用视觉识别调用（复用课表的 ai-proxy，失败自动降级模型） ---- */
+function impAiVision(dataUrl){
+  var chain=['qwen3.8-flash','qwen3.7-plus'];
+  function go(i){
+    if(i>=chain.length) return Promise.reject(new Error('识别服务暂不可用'));
+    var body={model:chain[i],messages:[{role:'user',content:[
+      {type:'text',text:IMP_PROMPT},
+      {type:'image_url',image_url:{url:dataUrl}}
+    ]}]};
+    return fetch(AI_PROXY,{
+      method:'POST',
+      headers:{'apikey':AI_PKEY,'Content-Type':'application/json'},
+      body:JSON.stringify(body)
+    }).then(function(r){
+      return r.text().then(function(txt){
+        if(!r.ok) throw new Error('HTTP '+r.status);
+        var j;
+        try{ j=JSON.parse(txt); }catch(e){ throw new Error('返回内容非 JSON'); }
+        if(j.error) throw new Error(j.error);
+        var c=j.choices&&j.choices[0]&&j.choices[0].message&&j.choices[0].message.content;
+        return ttExtractJson(c||'');
+      });
+    }).catch(function(e){
+      if(i+1>=chain.length) throw e;
+      return go(i+1);
+    });
+  }
+  return go(0);
+}
+
+/* ---- 姓名 / 项目 容错匹配 ---- */
+function impMatchStudent(raw){
+  var t=String(raw==null?'':raw).replace(/[\s　()（）·.、,，]/g,'');
+  if(!t) return null;
+  var hit=null;
+  DB.students.forEach(function(x){ if(!hit&&x.name===t) hit=x; });
+  if(hit) return {stu:hit,how:'exact'};
+  DB.students.forEach(function(x){ if(!hit&&t.indexOf(x.name)>=0) hit=x; });
+  return hit?{stu:hit,how:'fuzzy'}:null;
+}
+function impMatchItem(raw){
+  var t=String(raw==null?'':raw).replace(/[\s　]/g,'');
+  if(!t) return null;
+  var hit=null;
+  ITEMS.forEach(function(i){ if(!hit&&t===i.n) hit=i; });
+  if(hit) return {item:hit,how:'exact'};
+  /* 模糊匹配取重叠最长的，避免「英语单词」被「英语」抢走 */
+  var best=null,bestLen=0;
+  ITEMS.forEach(function(i){
+    var n=i.n, len=0;
+    if(t.indexOf(n)>=0) len=n.length;
+    else if(n.indexOf(t)>=0&&t.length>=2) len=t.length;
+    if(len>bestLen){ bestLen=len; best=i; }
+  });
+  return best?{item:best,how:'fuzzy'}:null;
+}
+
+/* ---- 生成一条待确认记录 ---- */
+function impMakeRecord(nameRaw,itemRaw,deltaRaw,date,note){
+  var ms=impMatchStudent(nameRaw);
+  var mi=impMatchItem(itemRaw);
+  var raw=String(deltaRaw==null?'':deltaRaw).replace(/[−–—－]/g,'-').replace(/[^\d.\-+]/g,'');
+  var d=parseFloat(raw);
+  if(isNaN(d)||d===0){
+    if(mi) d = mi.item.sign<0 ? -mi.item.d : mi.item.d;
+    else return null;
+  }
+  d=Math.round(d*10)/10;
+  /* 负分项目（违纪、监控抽查等）按惯例填正数，这里自动转成扣分，与手工录入口径一致 */
+  if(mi&&mi.item.sign<0&&d>0) d=-Math.abs(d);
+  var itemId = mi ? mi.item.id : (d<0?'wj':'cd');
+  var why='';
+  if(!ms) why='未找到该学生，不会导入';
+  else if(!mi) why='项目未识别，已按分值正负归入「'+impItemName(itemId)+'」';
+  return {
+    name: ms?ms.stu.name:String(nameRaw==null?'':nameRaw).trim(),
+    sid: ms?ms.stu.id:'',
+    ok: !!ms,
+    why: why,
+    item: itemId,
+    itemName: impItemName(itemId),
+    delta: d,
+    date: date,
+    note: note||'',
+    del:false
+  };
+}
+
+/* ---- AI 结果 → 记录 ---- */
+function impFromAi(j){
+  var arr=(j&&(j.records||j.entries||j.items))||[];
+  if(!Array.isArray(arr)) arr=[];
+  var base=IMP.date||impToday();
+  var date=base;
+  if(j&&typeof j.date==='string'){
+    var m=j.date.trim().match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+    if(m) date=m[1]+'-'+('0'+m[2]).slice(-2)+'-'+('0'+m[3]).slice(-2);
+  }
+  var out=[];
+  arr.forEach(function(r){
+    if(!r||typeof r!=='object') return;
+    var rec=impMakeRecord(
+      r.name!=null?r.name:(r.student!=null?r.student:r['姓名']),
+      r.item!=null?r.item:(r['项目']!=null?r['项目']:r.type),
+      r.delta!=null?r.delta:(r.value!=null?r.value:(r.score!=null?r.score:r['分值'])),
+      date,
+      r.note||r['备注']||''
+    );
+    if(rec) out.push(rec);
+  });
+  out.forEach(function(r,i){ r.i=i; });
+  return out;
+}
+
+/* ---- 表格解析：xlsx（纯前端解压，不依赖任何 CDN） ---- */
+function impInflate(u8){
+  if(typeof DecompressionStream==='undefined'){
+    return Promise.reject(new Error('当前浏览器不支持解压 xlsx，请另存为 CSV 再传'));
+  }
+  var ds=new DecompressionStream('deflate-raw');
+  var st=new Blob([u8]).stream().pipeThrough(ds);
+  return new Response(st).arrayBuffer().then(function(b){ return new Uint8Array(b); });
+}
+function impUnesc(s){
+  return String(s==null?'':s)
+    .replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"')
+    .replace(/&apos;/g,"'").replace(/&#(\d+);/g,function(_,d){return String.fromCharCode(+d)})
+    .replace(/&amp;/g,'&');
+}
+function impZipIndex(u8){
+  var n=u8.length,eocd=-1;
+  for(var i=n-22;i>=Math.max(0,n-66000);i--){
+    if(u8[i]===0x50&&u8[i+1]===0x4b&&u8[i+2]===0x05&&u8[i+3]===0x06){ eocd=i; break; }
+  }
+  if(eocd<0) throw new Error('不是有效的 xlsx 文件');
+  var dv=new DataView(u8.buffer,u8.byteOffset,u8.byteLength);
+  var cnt=dv.getUint16(eocd+10,true), off=dv.getUint32(eocd+16,true);
+  var files={}, p=off;
+  for(var k=0;k<cnt;k++){
+    if(p+46>n||dv.getUint32(p,true)!==0x02014b50) break;
+    var method=dv.getUint16(p+10,true);
+    var csize=dv.getUint32(p+20,true);
+    var nlen=dv.getUint16(p+28,true);
+    var elen=dv.getUint16(p+30,true);
+    var clen=dv.getUint16(p+32,true);
+    var lho=dv.getUint32(p+42,true);
+    var name='';
+    for(var j=0;j<nlen;j++) name+=String.fromCharCode(u8[p+46+j]);
+    files[name]={method:method,csize:csize,lho:lho};
+    p+=46+nlen+elen+clen;
+  }
+  return {files:files,dv:dv,u8:u8};
+}
+function impZipRead(zip,name){
+  var f=zip.files[name];
+  if(!f) return Promise.resolve(null);
+  var dv=zip.dv, u8=zip.u8, p=f.lho;
+  if(dv.getUint32(p,true)!==0x04034b50) return Promise.resolve(null);
+  var nlen=dv.getUint16(p+26,true), elen=dv.getUint16(p+28,true);
+  var start=p+30+nlen+elen;
+  var data=u8.subarray(start,start+f.csize);
+  if(f.method===0) return Promise.resolve(data);
+  if(f.method===8) return impInflate(data);
+  return Promise.resolve(null);
+}
+function impSharedStrings(xml){
+  if(!xml) return [];
+  var out=[], re=/<si\b[^>]*>([\s\S]*?)<\/si>/g, m;
+  while((m=re.exec(xml))){
+    var t='', re2=/<t\b[^>]*>([\s\S]*?)<\/t>/g, m2;
+    while((m2=re2.exec(m[1]))) t+=m2[1];
+    out.push(impUnesc(t));
+  }
+  return out;
+}
+function impColIdx(letters){
+  var n=0;
+  for(var i=0;i<letters.length;i++) n=n*26+(letters.charCodeAt(i)-64);
+  return n-1;
+}
+function impSheetRows(xml,shared){
+  var rows=[], rowRe=/<row\b[^>]*>([\s\S]*?)<\/row>/g, rm;
+  while((rm=rowRe.exec(xml))){
+    var cells=[], cRe=/<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g, cm;
+    while((cm=cRe.exec(rm[1]))){
+      var attr=cm[1]||'', inner=cm[2]||'';
+      var refM=/r="([A-Z]+)\d+"/.exec(attr);
+      var col=refM?impColIdx(refM[1]):cells.length;
+      var tM=/t="([^"]+)"/.exec(attr);
+      var type=tM?tM[1]:'';
+      var vm=/<v>([\s\S]*?)<\/v>/.exec(inner);
+      var v='';
+      if(type==='s'&&vm){ v=shared[parseInt(vm[1],10)]||''; }
+      else if(type==='inlineStr'){ var im=/<t\b[^>]*>([\s\S]*?)<\/t>/.exec(inner); v=im?impUnesc(im[1]):''; }
+      else if(vm){ v=impUnesc(vm[1]); }
+      cells[col]=String(v).trim();
+    }
+    rows.push(cells);
+  }
+  return rows;
+}
+function impReadXlsx(buf){
+  var u8=new Uint8Array(buf);
+  var zip=impZipIndex(u8);
+  var sheet='xl/worksheets/sheet1.xml';
+  if(!zip.files[sheet]){
+    Object.keys(zip.files).some(function(k){
+      if(/^xl\/worksheets\/sheet\d+\.xml$/.test(k)){ sheet=k; return true; }
+      return false;
+    });
+  }
+  if(!zip.files[sheet]) return Promise.reject(new Error('文件里没找到工作表'));
+  var dec=new TextDecoder('utf-8');
+  return Promise.all([
+    impZipRead(zip,'xl/sharedStrings.xml'),
+    impZipRead(zip,sheet)
+  ]).then(function(r){
+    var shared=r[0]?impSharedStrings(dec.decode(r[0])):[];
+    var sheetXml=r[1]?dec.decode(r[1]):'';
+    if(!sheetXml) throw new Error('工作表读取失败');
+    return impSheetRows(sheetXml,shared);
+  });
+}
+function impParseCsv(text){
+  var rows=[],row=[],cur='',q=false,i,ch;
+  text=String(text||'').replace(/^\uFEFF/,'');
+  for(i=0;i<text.length;i++){
+    ch=text[i];
+    if(q){
+      if(ch==='"'){
+        if(text[i+1]==='"'){ cur+='"'; i++; } else q=false;
+      } else cur+=ch;
+    }else{
+      if(ch==='"') q=true;
+      else if(ch===','||ch==='\t'){ row.push(cur); cur=''; }
+      else if(ch==='\n'){ row.push(cur); rows.push(row); row=[]; cur=''; }
+      else if(ch!=='\r') cur+=ch;
+    }
+  }
+  if(cur!==''||row.length){ row.push(cur); rows.push(row); }
+  return rows;
+}
+function impDecodeText(buf){
+  var u8=new Uint8Array(buf);
+  var t=new TextDecoder('utf-8').decode(u8);
+  if(t.indexOf('\uFFFD')>=0){
+    try{ t=new TextDecoder('gbk').decode(u8); }catch(e){}
+  }
+  return t;
+}
+
+/* ---- 二维表 → 记录（自动识别明细表 / 矩阵表） ---- */
+function impRowsToRecords(rows){
+  var clean=(rows||[]).filter(function(r){
+    return r&&r.join('').replace(/[\s　]/g,'')!=='';
+  });
+  if(clean.length<2) throw new Error('表格内容太少，至少要有表头和一行数据');
+
+  var headIdx=-1, i, j;
+  for(i=0;i<Math.min(5,clean.length);i++){
+    var line=clean[i].join('|');
+    if(/姓名|学生|名字/.test(line)){ headIdx=i; break; }
+    var hit=0;
+    for(j=0;j<clean[i].length;j++){ if(impMatchItem(clean[i][j])) hit++; }
+    if(hit>=2){ headIdx=i; break; }
+  }
+  if(headIdx<0) throw new Error('没认出表头，请确保有一列写着「姓名」或「学生」');
+  var head=clean[headIdx].map(function(c){ return String(c==null?'':c).trim(); });
+
+  var colName=-1,colItem=-1,colDelta=-1,colDate=-1,colNote=-1;
+  head.forEach(function(c,idx){
+    if(colName<0&&/姓名|学生|名字/.test(c)) colName=idx;
+    if(colItem<0&&/项目|事由|内容|类型|行为|加减项/.test(c)) colItem=idx;
+    if(colDelta<0&&/分值|分数|积分|得分|加减分|分值/.test(c)) colDelta=idx;
+    if(colDate<0&&/日期|时间|哪天/.test(c)) colDate=idx;
+    if(colNote<0&&/备注|说明|情况/.test(c)) colNote=idx;
+  });
+  if(colName<0) colName=0;
+
+  var dataRows=clean.slice(headIdx+1);
+  var out=[];
+  var baseDate=IMP.date||impToday();
+
+  if(colItem>=0){
+    /* 明细表：一行一条 */
+    dataRows.forEach(function(r){
+      var name=r[colName];
+      if(!name||!String(name).trim()) return;
+      var itemTxt=colItem>=0?r[colItem]:'';
+      var dTxt=colDelta>=0?r[colDelta]:'';
+      var date=baseDate;
+      if(colDate>=0&&/^\d{4}-\d{1,2}-\d{1,2}$/.test(String(r[colDate]||'').trim())){
+        var m=String(r[colDate]).trim().match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+        date=m[1]+'-'+('0'+m[2]).slice(-2)+'-'+('0'+m[3]).slice(-2);
+      }
+      var rec=impMakeRecord(name,itemTxt,dTxt,date,colNote>=0?r[colNote]:'');
+      if(rec) out.push(rec);
+    });
+  }else{
+    /* 矩阵表：姓名 × 项目 */
+    var itemCols=[];
+    head.forEach(function(c,idx){
+      if(idx===colName) return;
+      var mi=impMatchItem(c);
+      if(mi) itemCols.push({idx:idx,item:mi.item});
+    });
+    if(!itemCols.length) throw new Error('表头里没找到积分项目列（如「语文」「晨读」），也没找到「项目」列');
+    dataRows.forEach(function(r){
+      var nameRaw=r[colName];
+      if(!nameRaw||!String(nameRaw).trim()) return;
+      if(/合计|总分|小计/.test(String(nameRaw))) return;
+      var ms=impMatchStudent(nameRaw);
+      var stuName=ms?ms.stu.name:String(nameRaw).trim();
+      var stuId=ms?ms.stu.id:'';
+      itemCols.forEach(function(ic){
+        var cell=r[ic.idx];
+        var s=String(cell==null?'':cell).trim();
+        if(!s) return;
+        var d;
+        if(/^[√✓对]$/.test(s)) d=ic.item.sign<0?-ic.item.d:ic.item.d;
+        else{
+          var raw=s.replace(/[−–—－]/g,'-').replace(/[^\d.\-+]/g,'');
+          d=parseFloat(raw);
+          if(isNaN(d)) return;
+          if(ic.item.sign<0) d=-Math.abs(d);
+        }
+        if(!d) return;
+        out.push({
+          name:stuName,
+          sid:stuId,
+          ok:!!ms,
+          why:ms?'':'未找到该学生，不会导入',
+          item:ic.item.id,
+          itemName:ic.item.n,
+          delta:Math.round(d*10)/10,
+          date:baseDate,
+          note:'',
+          del:false
+        });
+      });
+    });
+  }
+  out.forEach(function(r,i){ r.i=i; });
+  return out;
+}
+
+/* ---- 导入页渲染 ---- */
+function ptsImport(){
+  var d=IMP.date||impToday();
+  var h='<div class="card"><div class="ch"><h3>① 上传积分记录</h3><span class="tag">图片识别 · Excel / CSV</span></div>';
+  h+='<div class="formrow">';
+  h+='<div class="field" style="width:170px"><label>记入日期</label><input type="date" id="impDate" value="'+d+'"></div>';
+  h+='<button class="btn pri" id="impImg">📷 上传图片识别</button>';
+  h+='<button class="btn ghost" id="impXls">📄 上传 Excel / CSV</button>';
+  h+='</div>';
+  h+='<div class="hint">图片：积分登记表的照片或截图，AI 自动读姓名和分值（约 10~25 秒）。表格：支持「姓名 / 项目 / 分值」明细表，也支持「姓名 × 项目」矩阵表。</div>';
+  h+='<div class="hint" id="impMsg" style="font-weight:600;color:#3b6ef5;min-height:18px">'+(IMP.msg||'')+'</div>';
+  h+='</div>';
+  h+='<div id="impPreview">'+impPreviewHtml()+'</div>';
+  afterRender.points=impBind;
+  return h;
+}
+function impPreviewHtml(){
+  var rows=IMP.rows;
+  if(!rows.length) return '';
+  var ok=rows.filter(function(r){ return r.ok&&!r.del; }).length;
+  var h='<div class="card"><div class="ch"><h3>② 预览并确认</h3>'+
+        '<span class="tag">共 '+rows.length+' 条 · 可导入 '+ok+' 条</span></div>';
+  h+=tbl([
+    {k:'name',label:'姓名',fmt:function(r){
+      return '<b style="'+(r.del?'opacity:.4':'')+'">'+esc(r.name||'—')+'</b>';
+    }},
+    {k:'itemName',label:'项目'},
+    {k:'delta',label:'分值',num:true,fmt:function(r){
+      return '<b class="'+(r.delta>0?'up':'down')+'">'+(r.delta>0?'+':'')+r.delta+'</b>';
+    }},
+    {k:'date',label:'日期'},
+    {k:'note',label:'备注',fmt:function(r){ return esc(r.note||''); }},
+    {k:'st',label:'状态',fmt:function(r){
+      if(r.del) return '<span class="badge">已删除</span>';
+      if(!r.ok) return '<span class="badge">未匹配</span>';
+      return '<span class="badge ok">就绪</span>';
+    }},
+    {k:'op',label:'',num:true,fmt:function(r){
+      if(r.del) return '<button class="btn ghost sm" data-impa="'+r.i+'">恢复</button>';
+      return '<button class="btn ghost sm" data-impdel="'+r.i+'">删除</button>';
+    }}
+  ],rows);
+  var warn=rows.filter(function(r){return !r.ok&&!r.del}).length;
+  if(warn) h+='<div class="hint" style="color:#e3524b;margin-top:8px">有 '+warn+' 条没匹配到学生，这些不会导入。可先去「学生管理」核对姓名，或删掉这几条。</div>';
+  h+='<div class="formrow" style="margin-top:12px">'+
+     '<button class="btn pri" id="impGo">确认导入 '+ok+' 条</button>'+
+     '<button class="btn ghost" id="impClear">清空全部</button></div>';
+  h+='<div class="hint">导入的记录来源标记为「表格/图片导入」，可在「积分管理 → 积分管理」页看到流水明细。</div>';
+  return h+'</div>';
+}
+function impSetMsg(t){
+  IMP.msg=t;
+  var el=$('impMsg'); if(el) el.textContent=t;
+}
+function impRefresh(){
+  var pv=$('impPreview'); if(pv) pv.innerHTML=impPreviewHtml();
+  impBind();
+}
+function impBind(){
+  var di=$('impDate');
+  if(di) di.onchange=function(){ IMP.date=di.value; };
+  var a=$('impImg'); if(a) a.onclick=impPickImage;
+  var b=$('impXls'); if(b) b.onclick=impPickSheet;
+  var g=$('impGo');  if(g) g.onclick=impCommit;
+  var c=$('impClear'); if(c) c.onclick=function(){
+    IMP.rows=[]; IMP.msg=''; impSetMsg('');
+    var pv=$('impPreview'); if(pv) pv.innerHTML='';
+  };
+  Array.prototype.forEach.call(document.querySelectorAll('[data-impdel]'),function(el){
+    el.onclick=function(){
+      var i=+el.getAttribute('data-impdel');
+      if(IMP.rows[i]) IMP.rows[i].del=true;
+      impRefresh();
+    };
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('[data-impa]'),function(el){
+    el.onclick=function(){
+      var i=+el.getAttribute('data-impa');
+      if(IMP.rows[i]) IMP.rows[i].del=false;
+      impRefresh();
+    };
+  });
+}
+
+/* ---- 图片通道 ---- */
+function impPickImage(){
+  if(IMP.busy){ toast('正在处理，请稍等'); return; }
+  var inp=document.createElement('input');
+  inp.type='file'; inp.accept='image/*';
+  inp.style.position='fixed'; inp.style.left='-9999px';
+  inp.onchange=function(){
+    var f=inp.files&&inp.files[0];
+    if(inp.parentNode) inp.parentNode.removeChild(inp);
+    if(f) impDoImage(f);
+  };
+  document.body.appendChild(inp);
+  inp.click();
+}
+function impDoImage(f){
+  if(!f.type||f.type.indexOf('image/')!==0){ toast('请选择图片文件'); return; }
+  IMP.busy=true;
+  impSetMsg('正在压缩图片…');
+  ttShrink(f,1800,0.9,function(big){
+    if(!big){ IMP.busy=false; impSetMsg('图片读取失败，换一张试试'); return; }
+    impSetMsg('AI 正在识别积分记录，约 10~25 秒，请稍候…');
+    impAiVision(big.url).then(function(j){
+      IMP.busy=false;
+      var recs=impFromAi(j);
+      if(!recs.length){
+        impSetMsg('没识别出记录。可以换张更清晰的图，或改用表格上传');
+        return;
+      }
+      IMP.rows=recs; IMP.src='import';
+      impSetMsg('识别到 '+recs.length+' 条，请核对姓名和分值后确认导入');
+      impRefresh();
+    }).catch(function(e){
+      IMP.busy=false;
+      impSetMsg('识别失败（'+((e&&e.message)||'网络异常')+'），可改用表格上传');
+    });
+  });
+}
+
+/* ---- 表格通道 ---- */
+function impPickSheet(){
+  if(IMP.busy){ toast('正在处理，请稍等'); return; }
+  var inp=document.createElement('input');
+  inp.type='file'; inp.accept='.xlsx,.csv,.txt,.xls';
+  inp.style.position='fixed'; inp.style.left='-9999px';
+  inp.onchange=function(){
+    var f=inp.files&&inp.files[0];
+    if(inp.parentNode) inp.parentNode.removeChild(inp);
+    if(f) impDoSheet(f);
+  };
+  document.body.appendChild(inp);
+  inp.click();
+}
+function impDoSheet(f){
+  var nm=(f.name||'').toLowerCase();
+  var isCsv=/\.(csv|txt)$/.test(nm);
+  if(/\.xls$/.test(nm)){
+    toast('老版 .xls 解析不了，请用 Excel 另存为 .xlsx 或 .csv 再传');
+    return;
+  }
+  IMP.busy=true;
+  impSetMsg('正在读取表格…');
+  var fr=new FileReader();
+  fr.onerror=function(){ IMP.busy=false; impSetMsg('文件读取失败'); };
+  fr.onload=function(){
+    var task=isCsv
+      ? Promise.resolve().then(function(){ return impParseCsv(impDecodeText(fr.result)); })
+      : impReadXlsx(fr.result);
+    task.then(function(rows){
+      IMP.busy=false;
+      var recs=impRowsToRecords(rows);
+      if(!recs.length){
+        impSetMsg('表格里没有读到有效数据，请检查每行是否有姓名和分值');
+        return;
+      }
+      IMP.rows=recs; IMP.src='import';
+      var bad=recs.filter(function(r){return !r.ok;}).length;
+      impSetMsg('读取到 '+recs.length+' 条'+(bad?('，其中 '+bad+' 条姓名没匹配上'):'')+'，请核对后导入');
+      impRefresh();
+    }).catch(function(e){
+      IMP.busy=false;
+      impSetMsg('解析失败：'+((e&&e.message)||'格式不支持'));
+    });
+  };
+  if(isCsv) fr.readAsArrayBuffer(f);
+  else fr.readAsArrayBuffer(f);
+}
+
+/* ---- 写入 ---- */
+function impCommit(){
+  var list=IMP.rows.filter(function(r){ return r.ok&&!r.del; });
+  if(!list.length){ toast('没有可导入的记录'); return; }
+  var batch='b'+uid();
+  var months={};
+  list.forEach(function(r){
+    var m=String(r.date).slice(0,7);
+    if(!/^\d{4}-\d{2}$/.test(m)) m=impToday().slice(0,7);
+    months[m]=1;
+    if(MONTHS.indexOf(m)<0){
+      MONTHS.push(m);
+      MONTHS.sort();
+      MLABEL[m]=parseInt(m.slice(5),10)+'月';
+    }
+    DB.events.push({
+      id:uid(), month:m, date:r.date, sid:r.sid, item:r.item,
+      delta:r.delta, note:r.note||(IMP.src==='import'?'批量导入':''),
+      src:'import', batch:batch, ts:Date.now()
+    });
+  });
+  save();
+  var mm=Object.keys(months);
+  if(mm.length===1) state.month=mm[0];
+  var n=list.length;
+  IMP.rows=[]; IMP.msg='';
+  state.ptab='record';
+  renderMenu(); renderHeader(); renderPage();
+  toast('已导入 '+n+' 条积分记录');
+}
+
 /* ============ 积分管理 ============ */
 function pagePoints(){
+  if(state.ptab==='import') return ptsImport();
   if(state.ptab==='record') return ptsRecord();
   if(state.ptab==='rank') return ptsRank();
   if(state.ptab==='group') return ptsGroup();
